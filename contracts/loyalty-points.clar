@@ -261,3 +261,91 @@
     (ok true)
   )
 )
+
+
+(define-constant err-self-transfer (err u109))
+(define-constant err-recipient-not-found (err u110))
+
+(define-public (transfer-points (recipient principal) (amount uint))
+  (let (
+    (sender-data (get-user-points tx-sender))
+    (recipient-data (get-user-points recipient))
+  )
+    (asserts! (not (is-eq tx-sender recipient)) (err err-self-transfer))
+    (asserts! (>= (get balance sender-data) amount) (err err-insufficient-points))
+    (asserts! (> amount u0) (err err-invalid-amount))
+    
+    (map-set user-points
+      { user: tx-sender }
+      {
+        balance: (- (get balance sender-data) amount),
+        lifetime-points: (get lifetime-points sender-data),
+        tier: (get tier sender-data)
+      }
+    )
+    
+    (map-set user-points 
+      { user: recipient }
+      {
+        balance: (+ (get balance recipient-data) amount),
+        lifetime-points: (get lifetime-points recipient-data),
+        tier: (get tier recipient-data)
+      }
+    )
+    (ok true)
+  )
+)
+
+
+(define-map reward-templates
+  { template-id: uint }
+  {
+    merchant: principal,
+    points-cost: uint,
+    name: (string-ascii 50),
+    description: (string-ascii 100),
+    duration: uint
+  }
+)
+
+(define-data-var template-nonce uint u0)
+
+(define-public (create-reward-template (points-cost uint) (name (string-ascii 50)) (description (string-ascii 100)) (duration uint))
+  (let (
+    (merchant-data (unwrap! (get-merchant tx-sender) (err err-merchant-not-found)))
+    (template-id (+ (var-get template-nonce) u1))
+  )
+    (asserts! (get is-active merchant-data) (err err-unauthorized))
+    (asserts! (> points-cost u0) (err err-invalid-amount))
+    (asserts! (> duration u0) (err err-invalid-amount))
+    
+    (map-set reward-templates
+      { template-id: template-id }
+      {
+        merchant: tx-sender,
+        points-cost: points-cost,
+        name: name,
+        description: description,
+        duration: duration
+      }
+    )
+    
+    (var-set template-nonce template-id)
+    (ok template-id)
+  )
+)
+
+(define-public (create-reward-from-template (template-id uint))
+  (let (
+    (template (unwrap! (map-get? reward-templates { template-id: template-id }) (err err-not-found)))
+  )
+    (asserts! (is-eq tx-sender (get merchant template)) (err err-unauthorized))
+    
+    (create-reward 
+      (get points-cost template)
+      (get name template)
+      (get description template)
+      (+ stacks-block-height (get duration template))
+    )
+  )
+)
