@@ -138,6 +138,9 @@
     (merchant-data (unwrap! (get-merchant tx-sender) (err err-merchant-not-found)))
     (user-data (get-user-points user))
     (user-merchant-data (get-user-merchant-stats user tx-sender))
+    (batch-data (get-user-batch-count user))
+    (new-batch-id (+ (get batch-count batch-data) u1))
+    (expiry-block (+ stacks-block-height (var-get global-expiry-duration)))
   )
     (asserts! (get is-active merchant-data) (err err-unauthorized))
     (asserts! (>= purchase-value (var-get min-purchase-amount)) (err err-invalid-amount))
@@ -160,7 +163,56 @@
       }
     )
     
+    (map-set point-expirations
+      { user: user, batch-id: new-batch-id }
+      {
+        points: amount,
+        expiry-block: expiry-block,
+        is-expired: false
+      }
+    )
+    
+    (map-set user-point-batches
+      { user: user }
+      { batch-count: new-batch-id }
+    )
+    
     (var-set total-points-issued (+ (var-get total-points-issued) amount))
+    (ok true)
+  )
+)
+
+(define-public (expire-point-batch (user principal) (batch-id uint))
+  (let (
+    (batch (unwrap! (get-point-expiration user batch-id) (err err-not-found)))
+    (user-data (get-user-points user))
+  )
+    (asserts! (< (get expiry-block batch) stacks-block-height) (err err-invalid-expiry))
+    (asserts! (not (get is-expired batch)) (err err-already-redeemed))
+    
+    (map-set point-expirations
+      { user: user, batch-id: batch-id }
+      (merge batch { is-expired: true })
+    )
+    
+    (map-set user-points
+      { user: user }
+      {
+        balance: (- (get balance user-data) (get points batch)),
+        lifetime-points: (get lifetime-points user-data),
+        tier: (get tier user-data)
+      }
+    )
+    
+    (ok (get points batch))
+  )
+)
+
+(define-public (set-expiry-duration (new-duration uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+    (asserts! (> new-duration u0) (err err-invalid-amount))
+    (var-set global-expiry-duration new-duration)
     (ok true)
   )
 )
@@ -354,8 +406,24 @@
 (define-constant err-self-partnership (err u205))
 (define-constant err-inactive-partnership (err u206))
 (define-constant err-window-expired (err u207))
+(define-constant err-invalid-expiry (err u208))
 
 (define-data-var partnership-nonce uint u0)
+(define-data-var global-expiry-duration uint u52560)
+
+(define-map point-expirations
+  { user: principal, batch-id: uint }
+  {
+    points: uint,
+    expiry-block: uint,
+    is-expired: bool
+  }
+)
+
+(define-map user-point-batches
+  { user: principal }
+  { batch-count: uint }
+)
 
 (define-map partnerships
   { partnership-id: uint }
@@ -395,6 +463,55 @@
   (default-to
     { merchant-a-last-purchase: u0, merchant-b-last-purchase: u0, total-bonus-earned: u0 }
     (map-get? user-partnership-progress { user: user, partnership-id: partnership-id })
+  )
+)
+
+(define-read-only (get-point-expiration (user principal) (batch-id uint))
+  (map-get? point-expirations { user: user, batch-id: batch-id })
+)
+
+(define-read-only (get-user-batch-count (user principal))
+  (default-to { batch-count: u0 } (map-get? user-point-batches { user: user }))
+)
+
+(define-read-only (calculate-active-points (user principal))
+  (let (
+    (batch-data (get-user-batch-count user))
+    (total-batches (get batch-count batch-data))
+  )
+    (fold calculate-active-batch-points 
+      (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20)
+      { user: user, active-points: u0, current-batch: u1, total-batches: total-batches }
+    )
+  )
+)
+
+(define-private (calculate-active-batch-points (batch-num uint) (acc { user: principal, active-points: uint, current-batch: uint, total-batches: uint }))
+  (if (<= (get current-batch acc) (get total-batches acc))
+    (match (get-point-expiration (get user acc) (get current-batch acc))
+      some-batch (if (and 
+                      (not (get is-expired some-batch))
+                      (< stacks-block-height (get expiry-block some-batch)))
+                   {
+                     user: (get user acc),
+                     active-points: (+ (get active-points acc) (get points some-batch)),
+                     current-batch: (+ (get current-batch acc) u1),
+                     total-batches: (get total-batches acc)
+                   }
+                   {
+                     user: (get user acc),
+                     active-points: (get active-points acc),
+                     current-batch: (+ (get current-batch acc) u1),
+                     total-batches: (get total-batches acc)
+                   })
+      {
+        user: (get user acc),
+        active-points: (get active-points acc),
+        current-batch: (+ (get current-batch acc) u1),
+        total-batches: (get total-batches acc)
+      }
+    )
+    acc
   )
 )
 
