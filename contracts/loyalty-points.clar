@@ -234,6 +234,7 @@
   (let (
     (merchant-data (unwrap! (get-merchant tx-sender) (err err-merchant-not-found)))
     (reward-id (+ (var-get reward-nonce) u1))
+    (merchant-perf (get-merchant-performance tx-sender))
   )
     (asserts! (get is-active merchant-data) (err err-unauthorized))
     (asserts! (> points-cost u0) (err err-invalid-amount))
@@ -251,6 +252,28 @@
       }
     )
     
+    ;; Initialize pricing data for new reward
+    (map-set reward-pricing
+      { reward-id: reward-id }
+      {
+        demand-score: u0,
+        redemption-count: u0,
+        last-updated: stacks-block-height,
+        current-multiplier: u100
+      }
+    )
+    
+    ;; Update merchant performance metrics
+    (map-set merchant-performance
+      { merchant: tx-sender }
+      {
+        total-rewards-created: (+ (get total-rewards-created merchant-perf) u1),
+        total-redemptions: (get total-redemptions merchant-perf),
+        performance-score: (get performance-score merchant-perf),
+        last-updated: stacks-block-height
+      }
+    )
+    
     (var-set reward-nonce reward-id)
     (ok reward-id)
   )
@@ -262,16 +285,19 @@
     (user-data (get-user-points tx-sender))
     (user-reward-data (default-to { redeemed: false, redeemed-at: u0 } 
                        (map-get? user-rewards { user: tx-sender, reward-id: reward-id })))
+    (dynamic-price (unwrap! (calculate-dynamic-price reward-id tx-sender) (err err-invalid-amount)))
+    (pricing-data (get-reward-pricing reward-id))
+    (merchant-perf (get-merchant-performance (get merchant reward)))
   )
     (asserts! (get is-active reward) (err err-unauthorized))
     (asserts! (not (get redeemed user-reward-data)) (err err-already-redeemed))
-    (asserts! (<= (get points-cost reward) (get balance user-data)) (err err-insufficient-points))
+    (asserts! (<= dynamic-price (get balance user-data)) (err err-insufficient-points))
     (asserts! (< stacks-block-height (get expiry reward)) (err err-expired))
     
     (map-set user-points
       { user: tx-sender }
       {
-        balance: (- (get balance user-data) (get points-cost reward)),
+        balance: (- (get balance user-data) dynamic-price),
         lifetime-points: (get lifetime-points user-data),
         tier: (get tier user-data)
       }
@@ -285,8 +311,108 @@
       }
     )
     
-    (var-set total-points-redeemed (+ (var-get total-points-redeemed) (get points-cost reward)))
+    ;; Update reward pricing based on redemption
+    (map-set reward-pricing
+      { reward-id: reward-id }
+      {
+        demand-score: (+ (get demand-score pricing-data) u10),
+        redemption-count: (+ (get redemption-count pricing-data) u1),
+        last-updated: stacks-block-height,
+        current-multiplier: (if (> (+ (get current-multiplier pricing-data) u5) (var-get max-price-multiplier))
+                              (var-get max-price-multiplier)
+                              (+ (get current-multiplier pricing-data) u5))
+      }
+    )
+    
+    ;; Update merchant performance
+    (map-set merchant-performance
+      { merchant: (get merchant reward) }
+      {
+        total-rewards-created: (get total-rewards-created merchant-perf),
+        total-redemptions: (+ (get total-redemptions merchant-perf) u1),
+        performance-score: (if (> (+ (get performance-score merchant-perf) u2) u150)
+                            u150
+                            (+ (get performance-score merchant-perf) u2)),
+        last-updated: stacks-block-height
+      }
+    )
+    
+    (var-set total-points-redeemed (+ (var-get total-points-redeemed) dynamic-price))
     (ok true)
+  )
+)
+
+;; Dynamic Pricing Engine Management Functions
+(define-public (configure-pricing-engine (enabled bool) (base-multiplier uint) (max-multiplier uint) (min-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+    (asserts! (and (> max-multiplier min-multiplier) (>= min-multiplier u25) (<= max-multiplier u500)) (err err-invalid-multiplier))
+    (var-set pricing-enabled enabled)
+    (var-set base-demand-multiplier base-multiplier)
+    (var-set max-price-multiplier max-multiplier)
+    (var-set min-price-multiplier min-multiplier)
+    (ok true)
+  )
+)
+
+(define-public (set-tier-discount (tier uint) (discount-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+    (asserts! (and (<= tier u3) (>= discount-multiplier u50) (<= discount-multiplier u100)) (err err-invalid-multiplier))
+    (map-set tier-discounts { tier: tier } { discount-multiplier: discount-multiplier })
+    (ok true)
+  )
+)
+
+(define-public (adjust-reward-pricing (reward-id uint) (new-multiplier uint))
+  (let (
+    (reward (unwrap! (get-reward reward-id) (err err-not-found)))
+    (pricing-data (get-reward-pricing reward-id))
+  )
+    (asserts! (or (is-eq tx-sender contract-owner) (is-eq tx-sender (get merchant reward))) (err err-unauthorized))
+    (asserts! (and (>= new-multiplier (var-get min-price-multiplier)) (<= new-multiplier (var-get max-price-multiplier))) (err err-invalid-multiplier))
+    
+    (map-set reward-pricing
+      { reward-id: reward-id }
+      {
+        demand-score: (get demand-score pricing-data),
+        redemption-count: (get redemption-count pricing-data),
+        last-updated: stacks-block-height,
+        current-multiplier: new-multiplier
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (decay-reward-demand (reward-id uint))
+  (let (
+    (pricing-data (get-reward-pricing reward-id))
+    (blocks-since-update (- stacks-block-height (get last-updated pricing-data)))
+    (decay-amount (/ blocks-since-update u1000))
+    (new-multiplier (if (< (- (get current-multiplier pricing-data) decay-amount) (var-get min-price-multiplier))
+                     (var-get min-price-multiplier)
+                     (- (get current-multiplier pricing-data) decay-amount)))
+  )
+    (map-set reward-pricing
+      { reward-id: reward-id }
+      {
+        demand-score: (if (< (- (get demand-score pricing-data) decay-amount) u0)
+                       u0
+                       (- (get demand-score pricing-data) decay-amount)),
+        redemption-count: (get redemption-count pricing-data),
+        last-updated: stacks-block-height,
+        current-multiplier: new-multiplier
+      }
+    )
+    (ok new-multiplier)
+  )
+)
+
+(define-public (bulk-decay-rewards (reward-ids (list 10 uint)))
+  (begin
+    (asserts! (var-get pricing-enabled) (err err-pricing-disabled))
+    (ok (map decay-reward-demand reward-ids))
   )
 )
 
@@ -407,6 +533,8 @@
 (define-constant err-inactive-partnership (err u206))
 (define-constant err-window-expired (err u207))
 (define-constant err-invalid-expiry (err u208))
+(define-constant err-invalid-multiplier (err u209))
+(define-constant err-pricing-disabled (err u210))
 
 (define-data-var partnership-nonce uint u0)
 (define-data-var global-expiry-duration uint u52560)
@@ -423,6 +551,37 @@
 (define-map user-point-batches
   { user: principal }
   { batch-count: uint }
+)
+
+;; Dynamic Pricing Engine Data Structures
+(define-data-var pricing-enabled bool true)
+(define-data-var base-demand-multiplier uint u100)
+(define-data-var max-price-multiplier uint u200)
+(define-data-var min-price-multiplier uint u50)
+
+(define-map reward-pricing
+  { reward-id: uint }
+  {
+    demand-score: uint,
+    redemption-count: uint,
+    last-updated: uint,
+    current-multiplier: uint
+  }
+)
+
+(define-map tier-discounts
+  { tier: uint }
+  { discount-multiplier: uint }
+)
+
+(define-map merchant-performance
+  { merchant: principal }
+  {
+    total-rewards-created: uint,
+    total-redemptions: uint,
+    performance-score: uint,
+    last-updated: uint
+  }
 )
 
 (define-map partnerships
@@ -464,6 +623,51 @@
     { merchant-a-last-purchase: u0, merchant-b-last-purchase: u0, total-bonus-earned: u0 }
     (map-get? user-partnership-progress { user: user, partnership-id: partnership-id })
   )
+)
+
+;; Dynamic Pricing Engine Read-Only Functions
+(define-read-only (get-reward-pricing (reward-id uint))
+  (default-to
+    { demand-score: u0, redemption-count: u0, last-updated: u0, current-multiplier: u100 }
+    (map-get? reward-pricing { reward-id: reward-id })
+  )
+)
+
+(define-read-only (get-tier-discount (tier uint))
+  (default-to { discount-multiplier: u100 } (map-get? tier-discounts { tier: tier }))
+)
+
+(define-read-only (get-merchant-performance (merchant principal))
+  (default-to
+    { total-rewards-created: u0, total-redemptions: u0, performance-score: u100, last-updated: u0 }
+    (map-get? merchant-performance { merchant: merchant })
+  )
+)
+
+(define-read-only (calculate-dynamic-price (reward-id uint) (user principal))
+  (let (
+    (reward (unwrap! (get-reward reward-id) (err err-not-found)))
+    (pricing-data (get-reward-pricing reward-id))
+    (user-tier (get-user-tier user))
+    (tier-discount (get-tier-discount user-tier))
+    (base-cost (get points-cost reward))
+    (demand-multiplier (get current-multiplier pricing-data))
+    (discount-multiplier (get discount-multiplier tier-discount))
+  )
+    (if (var-get pricing-enabled)
+      (ok (/ (* (* base-cost demand-multiplier) discount-multiplier) (* u100 u100)))
+      (ok base-cost)
+    )
+  )
+)
+
+(define-read-only (get-pricing-status)
+  {
+    enabled: (var-get pricing-enabled),
+    base-multiplier: (var-get base-demand-multiplier),
+    max-multiplier: (var-get max-price-multiplier),
+    min-multiplier: (var-get min-price-multiplier)
+  }
 )
 
 (define-read-only (get-point-expiration (user principal) (batch-id uint))
@@ -718,3 +922,49 @@
     (ok true)
   )
 )
+
+
+
+
+Commit Message:
+
+🎯 Launch intelligent market-driven reward pricing engine with demand analytics
+Pull Request Title:
+
+🎯 Smart Market Pricing Engine with Real-Time Demand Analytics  
+Pull Request Description:
+
+## Overview
+This change transforms our static loyalty system into a dynamic marketplace by introducing an intelligent pricing engine that automatically adjusts reward costs based on real-time demand patterns, user engagement metrics, and merchant performance data.
+
+## Core Capabilities
+
+### Dynamic Price Calculation
+- Real-time reward pricing based on demand multipliers and user tier benefits
+- Automatic price adjustments as rewards gain or lose popularity
+- Configurable bounds preventing extreme price fluctuations
+
+### User Tier Integration  
+- Premium tier members receive automatic pricing discounts
+- Tier-based loyalty incentives encourage customer progression
+- Flexible discount structures controllable by system administrators
+
+### Merchant Performance Tracking
+- Performance scoring system based on reward creation and redemption rates
+- Data-driven insights for merchant reward strategy optimization
+- Enhanced analytics for understanding customer engagement patterns
+
+### Intelligent Market Mechanics
+- Demand decay system prevents indefinite price inflation
+- Bulk processing capabilities for system-wide price optimization
+- Manual override controls for special promotions and events
+
+## Technical Architecture
+
+The engine introduces three new data maps tracking pricing metadata, demand analytics, and merchant performance metrics. All pricing calculations happen transparently during reward redemption, with automatic updates to demand scores and price multipliers.
+
+The system maintains full backward compatibility while operating entirely through existing reward redemption flows. Merchants gain access to sophisticated pricing controls without disrupting current operational patterns.
+
+## Business Value
+
+This upgrade creates a more engaging, market-responsive experience that benefits both customers and merchants through intelligent pricing that reflects actual demand and usage patterns while rewarding customer loyalty through tier-based benefits.
